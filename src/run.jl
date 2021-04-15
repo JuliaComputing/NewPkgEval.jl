@@ -371,6 +371,98 @@ function run_sandboxed_test(install::String, pkg; log_limit = 2^20 #= 1 MB =#,
     return version, status, reason, log
 end
 
+"""
+    run_compiled_test(install::String, pkg; compile_time_limit=30*60)
+
+Run the unit tests for a single package `pkg` (see `run_compiled_test`[@ref] for details and
+a list of supported keyword arguments), after first having compiled a system image that
+contains this package and its dependencies.
+
+To find incompatibilities, the compilation happens on an Ubuntu-based runner, while testing
+is performed in an Arch Linux container.
+"""
+function run_compiled_test(install::String, pkg; compile_time_limit=30*60, cache, kwargs...)
+    # prepare for launching a container
+    container = "$(pkg.name)-$(randstring(8))"
+    sysimage_path = "/cache/$(container).so"
+    script = raw"""
+        using Dates
+        print('#'^80, "\n# PackageCompiler set-up: $(now())\n#\n\n")
+
+        using InteractiveUtils
+        versioninfo()
+        println()
+
+        using Pkg
+        Pkg.UPDATED_REGISTRY_THIS_SESSION[] = true
+
+
+        print("\n\n", '#'^80, "\n# Installation: $(now())\n#\n\n")
+
+        Pkg.add(["PackageCompiler", ARGS[1]])
+
+
+        print("\n\n", '#'^80, "\n# Compiling: $(now())\n#\n\n")
+
+        using PackageCompiler
+
+        t = @elapsed create_sysimage(Symbol(ARGS[1]), sysimage_path=ARGS[2])
+        s = stat(ARGS[2]).size
+
+        println("Generated system image is ", Base.format_bytes(s), ", compilation took ", trunc(Int, t), " seconds")
+    """
+    cmd = `-e $script $(pkg.name) $sysimage_path`
+
+    output = Pipe()
+
+    function stop()
+        close(output)
+        kill_container(container)
+    end
+
+    container_lock = ReentrantLock()
+
+    p = run_sandboxed_julia(install, cmd; stdout=output, stderr=output,
+                            tty=false, wait=false, name=container, cache=cache, xvfb=false,
+                            kwargs...)
+
+    # kill on timeout
+    t = Timer(compile_time_limit) do timer
+        lock(container_lock) do
+            process_running(p) || return
+            stop()
+        end
+    end
+
+    # collect output and stats
+    t2 = @async begin
+        io = IOBuffer()
+        while process_running(p) && isopen(output)
+            line = readline(output)
+            println(io, line)
+        end
+        return String(take!(io))
+    end
+
+    wait(p)
+    close(t)
+    close(output)
+    log = fetch(t2)
+
+    if !success(p)
+        return missing, :fail, :uncompilable, log
+    end
+
+    # run the tests in an alternate environment (different OS, depot and Julia binaries
+    # in another path, etc)
+    version, status, reason, test_log =
+        run_sandboxed_test(install, pkg; runner="arch",
+                           cache=cache, sysimage=sysimage_path,
+                           user="user", group="group",
+                           install_dir="/usr/local/julia", kwargs...)
+    return version, status, reason, log * "\n" * test_log
+end
+
 function query_container(container)
     docker = connect("/var/run/docker.sock")
     write(docker, """GET /containers/$container/stats HTTP/1.1
@@ -394,6 +486,7 @@ end
 
 Base.@kwdef struct Configuration
     julia::VersionNumber = Base.VERSION
+    compiled::Bool = false
     # TODO: depwarn, checkbounds, etc
     # TODO: also move buildflags here?
 end
@@ -551,6 +644,7 @@ function run(configs::Vector{Configuration}, pkgs::Vector;
     end
 
     # Workers
+    # TODO: we don't want to do this for both. but rather one of the builds is compiled, the other not...
     try @sync begin
         for i = 1:ninstances
             push!(all_workers, @async begin
@@ -600,10 +694,12 @@ function run(configs::Vector{Configuration}, pkgs::Vector;
                             continue
                         end
 
+                        runner = config.compiled ? run_compiled_test : run_sandboxed_test
+
                         # perform an initial run
                         pkg_version, status, reason, log =
-                            run_sandboxed_test(install, pkg; cache=cache,
-                                               storage=storage, cpus=[i-1], kwargs...)
+                            runner(install, pkg; cache=cache,
+                                   storage=storage, cpus=[i-1], kwargs...)
 
                         # certain packages are known to have flaky tests; retry them
                         for j in 1:retries
@@ -611,8 +707,8 @@ function run(configs::Vector{Configuration}, pkgs::Vector;
                                pkg.name in retry_lists[pkg.registry]
                                 times[i] = now()
                                 pkg_version, status, reason, log =
-                                    run_sandboxed_test(install, pkg; cache=cache,
-                                                       storage=storage, cpus=[i-1], kwargs...)
+                                    runner(install, pkg; cache=cache,
+                                           storage=storage, cpus=[i-1], kwargs...)
                             end
                         end
 
