@@ -25,6 +25,7 @@ const reasons = Dict(
     :abort                  => "the process was aborted",
     :unreachable            => "an unreachable instruction was executed",
     :unknown                => "there were unidentified errors",
+    :uncompilable           => "compilation of the package failed",
     # kill
     :time_limit             => "test duration exceeded the time limit",
     :log_limit              => "test log exceeded the size limit",
